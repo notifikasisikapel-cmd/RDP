@@ -1,0 +1,101 @@
+name: RDP Windows Via CRD
+
+on:
+  workflow_dispatch:
+    inputs:
+      gh_crd_auth:
+        description: "Auth Code CRD (from remotedesktop.google.com/headless)"
+        required: true
+      gh_pc_name:
+        description: "PC Name (displayed in CRD)"
+        required: true
+      gh_pin_crd:
+        description: "PIN (min 6 digits)"
+        required: true
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; default 355)"
+        default: "355"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: mycrd
+  RDP_PASS: MySecurePass123
+
+jobs:
+  crd:
+    runs-on: windows-2022
+    timeout-minutes: 370
+    steps:
+      - name: 🔧 Resolve inputs
+        id: cfg
+        run: |
+          function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
+
+          $runtime = ToIntOr "${{ inputs.runtime_minutes }}" 355
+          if ($runtime -gt 360) { $runtime = 355 }
+          if ($runtime -lt 6) { $runtime = 355 }
+
+          "code=${{ inputs.gh_crd_auth }}"   | Out-File -Append $env:GITHUB_OUTPUT
+          "pcname=${{ inputs.gh_pc_name }}"  | Out-File -Append $env:GITHUB_OUTPUT
+          "pin=${{ inputs.gh_pin_crd }}"     | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime"                 | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "Resolved runtime=$runtime"
+
+      - name: 🔐 Enable RDP user (optional, for local access)
+        run: |
+          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: 📥 Download & Install Chrome Remote Desktop Host
+        run: |
+          $crdUrl = "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
+          $crdMsi = "$env:TEMP\crdhost.msi"
+          Invoke-WebRequest -Uri $crdUrl -OutFile $crdMsi -UseBasicParsing
+          Start-Process "msiexec.exe" -ArgumentList "/i `"$crdMsi`" /quiet /norestart" -Wait
+
+      - name: 🚀 Setup Chrome Remote Desktop
+        run: |
+          $crdPath = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $crdPath)) {
+            Write-Error "CRD not installed!"; exit 1
+          }
+
+          $code   = "${{ steps.cfg.outputs.code }}"
+          $pcname = "${{ steps.cfg.outputs.pcname }}"
+          $pin    = "${{ steps.cfg.outputs.pin }}"
+
+          if ($pin.Length -lt 6 -or ($pin -notmatch '^\d+$')) {
+            Write-Error "PIN must be at least 6 digits (numbers only)."; exit 1
+          }
+
+          & $crdPath `
+            --code="$code" `
+            --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+            --display-name="$pcname" `
+            --pin="$pin"
+
+      - name: ⏳ Keep alive
+        run: |
+          $mins=[int]"${{ steps.cfg.outputs.runtime }}"
+          $end=(Get-Date).AddMinutes($mins)
+          while((Get-Date) -lt $end){
+            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
+            Write-Host "CRD alive... ($left min left)"
+            Start-Sleep -Seconds 60
+          }
